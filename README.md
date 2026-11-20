@@ -33,6 +33,8 @@ The PS Vita bootloader passes a `SceKblParam` block containing the Syscon `wakeu
 
 Because `kscePowerRequestColdReset()` transitions the console from the `0xFF14` power-on state into `0xFF04`, the plugin naturally ignores manual reboots and prevents boot loops even as a hardware-level safeguard alongside the flag file.
 
+In the `0xFF04` state, the board's voltage regulators and capacitors are already charged, and `ScePower` has just performed an orderly teardown of drivers and LiveArea before resetting the SoC.
+
 ## Safety Features
 
 * **Hardware + file dual anti-loop guard:** Only triggers on power-on cold boots (`wakeup_factor & 0x7F == 0x14`) when `ur0:tai/.coldboot_done` is absent, and never removes the flag before the reboot completes.
