@@ -8,6 +8,8 @@ On some PS Vita consoles, turning the device on after a full shutdown can leave 
 
 `coldboot_reset.skprx` automates that HENkaku-style reboot right when the console powers on, so it enters a stable state without requiring a manual restart every time.
 
+> **Note:** This is not guaranteed to resolve instability on every PS Vita. Crashes and graphical artifacts can stem from many different factors (conflicting plugins, overclock/underclock profiles, battery wear, SD2Vita/storage issues, or thermal/hardware degradation), and this plugin only helps cases where a software Cold Reset on startup stabilizes the system.
+
 ## What It Does
 
 1. **First boot (power-on):**
