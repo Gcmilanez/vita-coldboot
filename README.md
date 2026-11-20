@@ -11,20 +11,22 @@ On some PS Vita consoles, turning the device on after a full shutdown can leave 
 ## What It Does
 
 1. **First boot (power-on):**
-   * Waits for `SceSyscon` and `SceShell` (LiveArea) to initialize, plus a `1.5 s` settle delay.
+   * Waits for `SceSyscon` and `SceShell` (LiveArea) to initialize, plus a `2.0 s` settle delay.
+   * Confirms via `SceKblParam` (`wakeup_factor & 0x7F == 0x14`) that this is a genuine power-on cold boot.
    * Writes and syncs a temporary flag file at `ur0:tai/.coldboot_done`.
    * Verifies the flag exists on disk and triggers `kscePowerRequestColdReset()`.
 2. **Second boot (after the automatic reset):**
-   * Detects and deletes `ur0:tai/.coldboot_done`.
+   * Detects the software-reset `wakeup_factor` (`0x04`) and deletes `ur0:tai/.coldboot_done`.
    * Logs both boot states to `ur0:tai/coldboot_reset.log`.
    * Exits its worker thread cleanly, leaving zero background overhead.
 
-It only runs during real boots (power-on or reboot) and does not trigger when waking from standby.
+It only runs on genuine power-on cold boots (skips manual reboots and standby/resume).
 
 ## Safety Features
 
+* **Hardware + file dual anti-loop guard:** Only triggers on power-on cold boots (`wakeup_factor & 0x7F == 0x14`) when `ur0:tai/.coldboot_done` is absent, and never removes the flag before the reboot completes.
 * **Safe Mode / Update / BSOD guard:** Automatically skips execution in Safe Mode, Update Mode, or post-BSOD reboots.
-* **Anti-bootloop check:** Aborts the reset if `ur0:tai/.coldboot_done` cannot be written, synced, and verified on disk.
+* **Disk verification:** Aborts the reset if `ur0:tai/.coldboot_done` cannot be written, synced, and verified on disk.
 * **Button bypass:**
   * Hold **`SELECT`** or **`R`** during startup to skip the automatic reset for that boot.
   * Hold **`L`** on boot to bypass all `taiHEN` plugins as usual.
@@ -43,7 +45,7 @@ ur0:tai/coldboot_reset.skprx
 ```
 
 4. Power off the PS Vita completely and turn it back on.
-   * After reaching LiveArea for ~1.5 s, the console will reboot once automatically and stay ready for normal use on the second boot.
+   * After reaching LiveArea for ~2 s, the console will reboot once automatically and stay ready for normal use on the second boot.
    * Check `ur0:/tai/coldboot_reset.log` in VitaShell to confirm `boot1_coldreset` followed by `boot2_ready`.
 
 ## Building from Source (VitaSDK)

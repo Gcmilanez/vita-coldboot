@@ -14,24 +14,27 @@
 
 #define POLL_STEP_US       100000U
 #define SHELL_WAIT_STEPS   200
-#define SETTLE_WAIT_STEPS  15
-#define PRE_RESET_DELAY_US 200000U
+#define SETTLE_WAIT_STEPS  20
+#define PRE_RESET_DELAY_US 300000U
+
+#define WAKEUP_MASK        0x7FU
+#define WAKEUP_COLD_BOOT   0x14U
 
 static volatile int g_stopping = 0;
 static SceUID g_thread_id = -1;
 
-static int is_skip_button_held(void) {
+static int is_skip_button_held(unsigned int *out_buttons) {
 	SceCtrlData pad;
-	SceUInt32 syscon_ctrl = 0;
 
 	memset(&pad, 0, sizeof(pad));
-	if (ksceCtrlPeekBufferPositive(0, &pad, 1) >= 0) {
-		if (pad.buttons & (SCE_CTRL_SELECT | SCE_CTRL_RTRIGGER | SCE_CTRL_LTRIGGER))
-			return 1;
-	}
+	if (out_buttons != NULL)
+		*out_buttons = 0;
 
-	if (ksceSysconGetControlsInfo(&syscon_ctrl) == 0) {
-		if (syscon_ctrl & (SCE_SYSCON_CTRL_SELECT | SCE_SYSCON_CTRL_RTRIGGER | SCE_SYSCON_CTRL_LTRIGGER))
+	/* Use SceCtrl positive-logic polling only (Syscon raw bits are active-low). */
+	if (ksceCtrlPeekBufferPositive(0, &pad, 1) > 0) {
+		if (out_buttons != NULL)
+			*out_buttons = pad.buttons;
+		if (pad.buttons & (SCE_CTRL_SELECT | SCE_CTRL_RTRIGGER | SCE_CTRL_LTRIGGER))
 			return 1;
 	}
 
@@ -81,9 +84,7 @@ static int read_small_file(const char *path, char *buf, SceSize cap) {
 	return n;
 }
 
-static void format_kbl_line(const char *stage, char *buf, SceSize cap) {
-	const SceKblParam *kbl = (const SceKblParam *)ksceKernelSysrootGetKblParam();
-
+static void format_kbl_line(const char *stage, const SceKblParam *kbl, char *buf, SceSize cap) {
 	if (kbl != NULL) {
 		snprintf(
 			buf,
@@ -105,15 +106,30 @@ static void sleep_interruptible(int steps) {
 		ksceKernelDelayThread(POLL_STEP_US);
 }
 
+static int remove_flag_sync(void) {
+	SceIoStat st;
+	int res;
+
+	if (ksceIoGetstat(FLAG_PATH, &st) < 0)
+		return 0;
+
+	res = ksceIoRemove(FLAG_PATH);
+	ksceIoSync("ur0:", 0);
+	return res;
+}
+
 static int worker_thread(SceSize args, void *argp) {
 	(void)args;
 	(void)argp;
 
 	SceIoStat st;
+	const SceKblParam *kbl;
 	char boot1_info[128];
 	char boot2_info[128];
-	char log_buf[260];
+	char log_buf[320];
+	unsigned int buttons = 0;
 	int shell_ready = 0;
+	int has_flag;
 
 	ksceSysconWaitInitialized();
 
@@ -126,51 +142,79 @@ static int worker_thread(SceSize args, void *argp) {
 	}
 
 	if (!shell_ready || g_stopping)
-		return ksceKernelExitDeleteThread(0);
+		return ksceKernelExitThread(0);
 
 	/* Allow SceShell, ScePower, and SceCtrl to settle before reading input or resetting. */
 	sleep_interruptible(SETTLE_WAIT_STEPS);
 	if (g_stopping)
-		return ksceKernelExitDeleteThread(0);
+		return ksceKernelExitThread(0);
 
-	if (is_skip_button_held()) {
-		if (ksceIoGetstat(FLAG_PATH, &st) == 0) {
-			ksceIoRemove(FLAG_PATH);
-			ksceIoSync("ur0:", 0);
-		}
-		format_kbl_line("skipped_by_button", log_buf, sizeof(log_buf));
+	kbl = (const SceKblParam *)ksceKernelSysrootGetKblParam();
+	has_flag = (ksceIoGetstat(FLAG_PATH, &st) == 0);
+
+	if (is_skip_button_held(&buttons)) {
+		int rm_res = remove_flag_sync();
+		format_kbl_line("skipped_by_button", kbl, boot1_info, sizeof(boot1_info));
+		snprintf(log_buf, sizeof(log_buf), "buttons=0x%08X rm=%d %s", buttons, rm_res, boot1_info);
 		write_file_sync(LOG_PATH, log_buf, strlen(log_buf));
-		return ksceKernelExitDeleteThread(0);
+		return ksceKernelExitThread(0);
 	}
 
-	if (ksceIoGetstat(FLAG_PATH, &st) == 0) {
-		/* Second boot after our automatic Cold Reset: clear flag and continue normally. */
-		read_small_file(FLAG_PATH, boot1_info, sizeof(boot1_info));
-		ksceIoRemove(FLAG_PATH);
-		ksceIoSync("ur0:", 0);
+	if (kbl == NULL) {
+		remove_flag_sync();
+		format_kbl_line("aborted_kbl_null", kbl, log_buf, sizeof(log_buf));
+		write_file_sync(LOG_PATH, log_buf, strlen(log_buf));
+		return ksceKernelExitThread(0);
+	}
 
-		format_kbl_line("boot2_ready", boot2_info, sizeof(boot2_info));
+	/* Hardware guard: only reboot on genuine cold power-on (wakeup_factor & 0x7F == 0x14). */
+	if ((kbl->wakeup_factor & WAKEUP_MASK) != WAKEUP_COLD_BOOT) {
+		int rm_res = 0;
+		boot1_info[0] = '\0';
+		if (has_flag) {
+			read_small_file(FLAG_PATH, boot1_info, sizeof(boot1_info));
+			rm_res = remove_flag_sync();
+			format_kbl_line("boot2_ready", kbl, boot2_info, sizeof(boot2_info));
+		} else {
+			format_kbl_line("boot_already_warm_or_reset", kbl, boot2_info, sizeof(boot2_info));
+		}
+
+		if (rm_res < 0)
+			snprintf(log_buf, sizeof(log_buf), "%srm_err=0x%08X %s", boot1_info, (unsigned int)rm_res, boot2_info);
+		else
+			snprintf(log_buf, sizeof(log_buf), "%s%s", boot1_info, boot2_info);
+
+		write_file_sync(LOG_PATH, log_buf, strlen(log_buf));
+		return ksceKernelExitThread(0);
+	}
+
+	/* Secondary file guard: if a stale flag already exists on cold boot, clear it and skip reset. */
+	if (has_flag) {
+		read_small_file(FLAG_PATH, boot1_info, sizeof(boot1_info));
+		remove_flag_sync();
+		format_kbl_line("cleared_stale_flag", kbl, boot2_info, sizeof(boot2_info));
 		snprintf(log_buf, sizeof(log_buf), "%s%s", boot1_info, boot2_info);
 		write_file_sync(LOG_PATH, log_buf, strlen(log_buf));
-		return ksceKernelExitDeleteThread(0);
+		return ksceKernelExitThread(0);
 	}
 
-	/* First boot from power-off: persist flag on ur0: before requesting Cold Reset. */
-	format_kbl_line("boot1_coldreset", boot1_info, sizeof(boot1_info));
+	/* Genuine cold boot from power-off: persist flag and trigger Cold Reset once. */
+	format_kbl_line("boot1_coldreset", kbl, boot1_info, sizeof(boot1_info));
 	if (write_file_sync(FLAG_PATH, boot1_info, strlen(boot1_info)) < 0 ||
 	    ksceIoGetstat(FLAG_PATH, &st) < 0 || st.st_size <= 0) {
-		/* Never reboot if the flag file could not be verified on disk (prevents boot loops). */
-		format_kbl_line("aborted_flag_error", log_buf, sizeof(log_buf));
+		format_kbl_line("aborted_flag_error", kbl, log_buf, sizeof(log_buf));
 		write_file_sync(LOG_PATH, log_buf, strlen(log_buf));
-		return ksceKernelExitDeleteThread(0);
+		return ksceKernelExitThread(0);
 	}
 
+	write_file_sync(LOG_PATH, boot1_info, strlen(boot1_info));
 	ksceKernelDelayThread(PRE_RESET_DELAY_US);
+
+	/* Never delete FLAG_PATH after requesting Cold Reset (teardown can exceed 5s). */
 	if (!g_stopping)
 		kscePowerRequestColdReset();
 
-	sleep_interruptible(50);
-	return ksceKernelExitDeleteThread(0);
+	return ksceKernelExitThread(0);
 }
 
 int _start(SceSize args, void *argp) __attribute__((weak, alias("module_start")));
@@ -215,6 +259,7 @@ int module_stop(SceSize args, void *argp) {
 	if (g_thread_id >= 0) {
 		SceUInt timeout = 500000U;
 		ksceKernelWaitThreadEnd(g_thread_id, NULL, &timeout);
+		ksceKernelDeleteThread(g_thread_id);
 		g_thread_id = -1;
 	}
 
