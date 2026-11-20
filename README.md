@@ -1,40 +1,39 @@
 # vita-coldboot (`coldboot_reset.skprx`)
 
-Plugin de kernel (`*KERNEL`) para PS Vita (HENkaku Ensō) que executa automaticamente **um único Cold Reset (`kscePowerRequestColdReset`)** quando o console dá boot, e depois deixa o sistema subir normalmente.
+A lightweight PS Vita kernel plugin (`*KERNEL`) for HENkaku Ensō that automatically performs a single **Cold Reset** (`kscePowerRequestColdReset`) on startup and then lets the system run normally.
 
-## O que ele faz (e o que não faz)
+## What Problem It Solves
 
-Quando o PS Vita liga do zero, o plugin automatiza o equivalente a ir em **Configurações → Configurações do HENkaku → Reiniciar dispositivo** uma única vez na inicialização:
+On some PS Vita consoles, turning the device on after a full shutdown can leave the system prone to random crashes or minor graphical artifacts on screen, while rebooting via HENkaku Settings resolves the instability.
 
-* **O que faz:** dispara `kscePowerRequestColdReset()`, reiniciando o kernel, os drivers (incluindo GPU/vídeo), os registradores do SoC e a RAM carregada naquele boot; no segundo boot, remove sua flag temporária e encerra a própria thread (sem ficar rodando em segundo plano).
-* **Quando atua:** apenas em **boots reais** (ex.: ao ligar o console após desligar por completo).
-* **Quando NÃO atua:** não roda ao entrar ou acordar do **Modo de Repouso (*standby*)**, porque o kernel apenas retoma a RAM suspensa sem recarregar plugins do `taiHEN`.
-* **O que NÃO faz:** não apaga caches em disco, não faz *Rebuild Database* e não reseta o controlador de energia/bateria (*Syscon / Ernie*).
-* **Observação sobre reinício manual:** como a flag é removida no 2º boot, se você mandar reiniciar manualmente pelo HENkaku/VitaShell enquanto o Vita já está ligado, ele também executará 1 ciclo extra na volta.
+`coldboot_reset.skprx` automates that HENkaku-style reboot right when the console powers on, so it enters a stable state without requiring a manual restart every time.
 
-## Como funciona passo a passo
+## What It Does
 
-1. **1º boot (ao ligar o console):**
-   * Aguarda `SceSyscon` e o processo da LiveArea (`SceShell`) iniciarem (`ksceKernelSysrootGetShellPid() > 0`), mais `1,5 s` de estabilização.
-   * Verifica se `ur0:tai/.coldboot_done` existe.
-   * Como **não existe**, grava a flag em `ur0:tai/.coldboot_done`, força sincronização no armazenamento (`ksceIoSyncByFd` + `ksceIoSync("ur0:", 0)`), confirma com `ksceIoGetstat` que o arquivo está salvo com tamanho > 0 e chama `kscePowerRequestColdReset()`.
-2. **2º boot (logo após o Cold Reset):**
-   * Encontra `ur0:tai/.coldboot_done`, apaga a flag e sobrescreve `ur0:tai/coldboot_reset.log` com os indicadores do `SceKblParam` dos dois boots (`boot1_coldreset` e `boot2_ready`).
-   * Encerra a thread (`ksceKernelExitDeleteThread(0)`) e o PS Vita segue normalmente na LiveArea.
+1. **First boot (power-on):**
+   * Waits for `SceSyscon` and `SceShell` (LiveArea) to initialize, plus a `1.5 s` settle delay.
+   * Writes and syncs a temporary flag file at `ur0:tai/.coldboot_done`.
+   * Verifies the flag exists on disk and triggers `kscePowerRequestColdReset()`.
+2. **Second boot (after the automatic reset):**
+   * Detects and deletes `ur0:tai/.coldboot_done`.
+   * Logs both boot states to `ur0:tai/coldboot_reset.log`.
+   * Exits its worker thread cleanly, leaving zero background overhead.
 
-## Proteções contra boot loop
+It only runs during real boots (power-on or reboot) and does not trigger when waking from standby.
 
-* **Modo de Segurança / Update / BSOD:** verifica `ksceSysrootIsSafeMode()`, `ksceSysrootIsUpdateMode()` e `ksceSysrootIsBsodReboot()` e sai sem fazer nada (`SCE_KERNEL_START_NO_RESIDENT`).
-* **Verificação em disco:** se `ur0:tai/.coldboot_done` não puder ser gravada e confirmada com tamanho > 0, o plugin **aborta o reset**.
-* **Botões para pular o reset:**
-  * Segurar **`SELECT`** ou **`R`** durante o boot cancela o reset automático apenas daquela inicialização (mantendo todos os outros plugins).
-  * Segurar **`L`** ao ligar desativa todos os plugins do `taiHEN` normalmente.
+## Safety Features
 
-## Instalação
+* **Safe Mode / Update / BSOD guard:** Automatically skips execution in Safe Mode, Update Mode, or post-BSOD reboots.
+* **Anti-bootloop check:** Aborts the reset if `ur0:tai/.coldboot_done` cannot be written, synced, and verified on disk.
+* **Button bypass:**
+  * Hold **`SELECT`** or **`R`** during startup to skip the automatic reset for that boot.
+  * Hold **`L`** on boot to bypass all `taiHEN` plugins as usual.
 
-1. Baixe o arquivo `coldboot_reset.skprx` na seção **Releases** deste repositório.
-2. Copie `coldboot_reset.skprx` para `ur0:/tai/coldboot_reset.skprx` (via VitaShell / FTP).
-3. Adicione a linha abaixo na seção `*KERNEL` do seu `ur0:/tai/config.txt`:
+## Installation
+
+1. Download `coldboot_reset.skprx` from the [Releases](https://github.com/Gcmilanez/vita-coldboot/releases) page.
+2. Copy `coldboot_reset.skprx` to `ur0:/tai/coldboot_reset.skprx` (via VitaShell / FTP).
+3. Add it under `*KERNEL` in `ur0:/tai/config.txt`:
 
 ```text
 *KERNEL
@@ -43,11 +42,11 @@ ur0:tai/nonpdrm.skprx
 ur0:tai/coldboot_reset.skprx
 ```
 
-4. Desligue o console por completo e ligue novamente.
-   * Ele entrará na LiveArea por ~1,5 s, fará 1 reinício automático e permanecerá ligado no 2º boot.
-   * Para confirmar o funcionamento, abra `ur0:/tai/coldboot_reset.log` no VitaShell e verifique se constam `boot1_coldreset` e `boot2_ready`.
+4. Power off the PS Vita completely and turn it back on.
+   * After reaching LiveArea for ~1.5 s, the console will reboot once automatically and stay ready for normal use on the second boot.
+   * Check `ur0:/tai/coldboot_reset.log` in VitaShell to confirm `boot1_coldreset` followed by `boot2_ready`.
 
-## Compilação (VitaSDK)
+## Building from Source (VitaSDK)
 
 ```bash
 export VITASDK=/usr/local/vitasdk
